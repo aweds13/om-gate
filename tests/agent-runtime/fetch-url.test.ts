@@ -1,0 +1,408 @@
+/**
+ * fetch_url engine tests — ported from the reference product's
+ * tests/agent-runtime/fetch-url.test.ts.
+ *
+ * The strict-fetch path's security core is exercised here (private-IP literal
+ * spellings, unsafe DNS answer sets, userinfo/nonstandard ports, redirect
+ * revalidation), together with the bounded download, the anti-bot marker
+ * check, the HTML→markdown golden case, the PDF provider chain, and abort
+ * handling. The tool-level trust-gate refusal and persistence round-trip are
+ * in fetch-url-tool.test.ts.
+ */
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { PDFDocument } from 'pdf-lib';
+
+import { getDocumentExtractorProvider, type DocumentArtifact } from '@/lib/document';
+import {
+  assertSafeLookupAddresses,
+  extractHtmlToMarkdown,
+  fetchAndExtractUrl,
+  FetchUrlError,
+  normalizeUntrustedText,
+} from '@/lib/server/agent-runtime/fetch-url';
+import { normalizeUrlForStrictFetch } from '@/lib/server/ssrf-guard';
+
+const dispatcher = {} as never;
+const chineseFixture = readFileSync(
+  resolve(process.cwd(), 'tests/fixtures/fetch-url/chinese-article.html'),
+  'utf8',
+);
+
+function pdfArtifact(providerId: string, text: string): DocumentArtifact {
+  return {
+    metadata: { fileName: 'fetched.pdf', mimeType: 'application/pdf', providerId },
+    blocks: [{ id: 'block-1', type: 'markdown', text }],
+    assets: [],
+  };
+}
+
+async function pdfBytes(pageCount = 1): Promise<Buffer> {
+  const pdf = await PDFDocument.create();
+  for (let page = 0; page < pageCount; page += 1) pdf.addPage();
+  return Buffer.from(await pdf.save());
+}
+
+afterEach(() => vi.restoreAllMocks());
+
+describe('fetch_url network and extraction', () => {
+  it.each([
+    'http://127.0.0.1',
+    'http://2130706433',
+    'http://0177.0.0.1',
+    'http://[::1]',
+    'http://[::ffff:127.0.0.1]',
+    'http://100.100.100.200',
+    'http://[fd00:ec2::254]',
+    'http://metadata.google.internal',
+  ])('rejects private IP literal spelling %s before lookup', (url) => {
+    expect(() => normalizeUrlForStrictFetch(url)).toThrow(/private|reserved/i);
+  });
+
+  it('rejects a DNS answer set when any resolved address is unsafe', () => {
+    expect(() =>
+      assertSafeLookupAddresses([
+        { address: '93.184.216.34', family: 4 },
+        { address: '127.0.0.1', family: 4 },
+      ]),
+    ).toThrow(/private|reserved/i);
+  });
+
+  it('rejects userinfo and nonstandard ports', () => {
+    expect(() => normalizeUrlForStrictFetch('https://user:pass@example.com/')).toThrow(/userinfo/i);
+    expect(() => normalizeUrlForStrictFetch('https://example.com:8443/')).toThrow(
+      /ports 80 and 443/i,
+    );
+  });
+
+  it('revalidates redirects and rejects an internal target', async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValue(
+        new Response(null, { status: 302, headers: { location: 'http://2130706433/secret' } }),
+      );
+    await expect(
+      fetchAndExtractUrl('https://example.com/start', { fetchImpl, dispatcher }),
+    ).rejects.toThrow(/private|reserved/i);
+    expect(fetchImpl).toHaveBeenCalledOnce();
+  });
+
+  it('checks every redirect target with the supplied session trust gate before fetching it', async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(
+      new Response(null, {
+        status: 302,
+        headers: { location: 'https://untrusted.example/landing' },
+      }),
+    );
+    const isUrlAllowed = vi.fn().mockResolvedValue(false);
+
+    await expect(
+      fetchAndExtractUrl('https://trusted.example/start', {
+        fetchImpl,
+        dispatcher,
+        isUrlAllowed,
+      }),
+    ).rejects.toMatchObject({ reason: 'blocked' });
+    expect(isUrlAllowed).toHaveBeenCalledWith('https://untrusted.example/landing');
+    expect(fetchImpl).toHaveBeenCalledOnce();
+  });
+
+  it('streams only to the byte limit and marks the material truncated', async () => {
+    const body = '正文'.repeat(300);
+    const fetchImpl = vi.fn().mockResolvedValue(
+      new Response(body, {
+        headers: {
+          'content-type': 'text/plain; charset=utf-8',
+          'content-length': String(body.length * 3),
+        },
+      }),
+    );
+    const result = await fetchAndExtractUrl('https://example.com/large.txt', {
+      fetchImpl,
+      dispatcher,
+      maxBytes: 300,
+      minChars: 20,
+    });
+    expect(result.truncated).toBe(true);
+    expect(result.downloadedBytes).toBe(300);
+    expect(Buffer.byteLength(result.markdown)).toBeLessThanOrEqual(300);
+  });
+
+  it('enforces an absolute body deadline against slow-drip responses', async () => {
+    const body = new ReadableStream<Uint8Array>({
+      async pull(stream) {
+        stream.enqueue(new TextEncoder().encode('x'));
+        await new Promise((resolve) => setTimeout(resolve, 8));
+      },
+    });
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValue(new Response(body, { headers: { 'content-type': 'text/plain' } }));
+
+    await expect(
+      fetchAndExtractUrl('https://example.com/slow-drip', {
+        fetchImpl,
+        dispatcher,
+        bodyTimeoutMs: 20,
+        minChars: 1,
+      }),
+    ).rejects.toMatchObject({ reason: 'network', message: /Timed out/ });
+  });
+
+  it('fails loudly when an anti-bot marker is returned with HTTP 200', async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(
+      new Response(`页面提示：环境异常/完成验证。${'占位'.repeat(200)}`, {
+        headers: { 'content-type': 'text/plain' },
+      }),
+    );
+    await expect(
+      fetchAndExtractUrl('https://example.com/blocked', {
+        fetchImpl,
+        dispatcher,
+        minChars: 20,
+      }),
+    ).rejects.toMatchObject({ reason: 'blocked' } satisfies Partial<FetchUrlError>);
+  });
+
+  /**
+   * `captcha` 是一个**子串**匹配，而它以前是对**整页 HTML** 做的。现代前端
+   * bundle 里出现这个词太正常了（验证码组件、埋点、i18n 词表），实测代价是
+   * 2026-10-05 那节课 75 次 fetch_url 里有 2 次被 `(captcha)` 误拦。
+   *
+   * 判据移到抽取后的正文之后，bundle 里的字符串不再进入判定，而真正的验证码
+   * 拦截页（可见文字里有这些词）仍然拦得住 —— 上一条测试就是那个方向。
+   */
+  it('does not block a readable page just because its scripts mention captcha', async () => {
+    const article = '这是一篇正常的技术文章正文。'.repeat(40);
+    const html = [
+      '<!DOCTYPE html><html><head>',
+      '<script>window.__recaptcha__="captcha";var t="captcha";</script>',
+      '</head><body><article><p>',
+      article,
+      '</p></article></body></html>',
+    ].join('');
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValue(new Response(html, { headers: { 'content-type': 'text/html' } }));
+
+    const result = await fetchAndExtractUrl('https://example.com/article', {
+      fetchImpl,
+      dispatcher,
+      minChars: 20,
+    });
+
+    expect(result.markdown).toContain('正常的技术文章正文');
+    // The script body is dropped by extraction, so it cannot reach the judge.
+    expect(result.markdown).not.toContain('__recaptcha__');
+  });
+
+  it('selects configured self-hosted MinerU for PDF extraction', async () => {
+    const mineru = getDocumentExtractorProvider('mineru')!;
+    const unpdf = getDocumentExtractorProvider('unpdf')!;
+    const mineruExtract = vi
+      .spyOn(mineru, 'extract')
+      .mockResolvedValue(pdfArtifact('mineru', 'MinerU 正文'.repeat(50)));
+    const unpdfExtract = vi.spyOn(unpdf, 'extract');
+    const fetchImpl = vi.fn().mockResolvedValue(
+      new Response((await pdfBytes()) as unknown as BodyInit, {
+        headers: { 'content-type': 'application/pdf' },
+      }),
+    );
+
+    const result = await fetchAndExtractUrl('https://example.com/document.pdf', {
+      fetchImpl,
+      dispatcher,
+      minChars: 20,
+      // The document slot's service: self-hosted MinerU.
+      extractionServices: {
+        document: {
+          providerId: 'mineru',
+          baseUrl: 'http://mineru.internal:8000',
+          managed: true,
+          userEndpoint: false,
+          origin: 'configuration',
+        },
+      },
+    });
+
+    expect(result.markdown).toContain('MinerU 正文');
+    expect(mineruExtract).toHaveBeenCalledWith(
+      expect.objectContaining({ config: expect.objectContaining({ providerId: 'mineru' }) }),
+    );
+    expect(unpdfExtract).not.toHaveBeenCalled();
+  });
+
+  it('falls back to unpdf when no managed PDF provider is configured', async () => {
+    const unpdf = getDocumentExtractorProvider('unpdf')!;
+    const unpdfExtract = vi
+      .spyOn(unpdf, 'extract')
+      .mockResolvedValue(pdfArtifact('unpdf', 'unpdf 正文'.repeat(50)));
+    const fetchImpl = vi.fn().mockResolvedValue(
+      new Response((await pdfBytes()) as unknown as BodyInit, {
+        headers: { 'content-type': 'application/pdf' },
+      }),
+    );
+
+    const result = await fetchAndExtractUrl('https://example.com/document.pdf', {
+      fetchImpl,
+      dispatcher,
+      minChars: 20,
+      extractionServices: { document: null },
+    });
+
+    expect(result.markdown).toContain('unpdf 正文');
+    expect(unpdfExtract).toHaveBeenCalledWith(
+      expect.objectContaining({
+        config: expect.objectContaining({ providerId: 'unpdf', textOnly: true }),
+      }),
+    );
+  });
+
+  it('resolves the document service lazily, only when the page is a PDF', async () => {
+    const unpdf = getDocumentExtractorProvider('unpdf')!;
+    vi.spyOn(unpdf, 'extract').mockResolvedValue(pdfArtifact('unpdf', 'PDF text. '.repeat(50)));
+    const brokenDocumentSlot = vi.fn(async () => {
+      throw new Error('document slot misconfigured');
+    });
+    const html = `<html><head><title>Page</title></head><body><article><p>${'Plain paragraph text. '.repeat(30)}</p></article></body></html>`;
+
+    const page = await fetchAndExtractUrl('https://example.com/page', {
+      fetchImpl: vi
+        .fn()
+        .mockResolvedValue(new Response(html, { headers: { 'content-type': 'text/html' } })),
+      dispatcher,
+      minChars: 20,
+      loadExtractionServices: brokenDocumentSlot,
+    });
+    expect(page.markdown).toContain('Plain paragraph text.');
+    expect(brokenDocumentSlot).not.toHaveBeenCalled();
+
+    const loadExtractionServices = vi.fn(async () => ({ document: null }));
+    const pdf = await fetchAndExtractUrl('https://example.com/document.pdf', {
+      fetchImpl: vi.fn().mockResolvedValue(
+        new Response((await pdfBytes()) as unknown as BodyInit, {
+          headers: { 'content-type': 'application/pdf' },
+        }),
+      ),
+      dispatcher,
+      minChars: 20,
+      loadExtractionServices,
+    });
+    expect(pdf.markdown).toContain('PDF text.');
+    expect(loadExtractionServices).toHaveBeenCalledOnce();
+  });
+
+  // pdf-lib 造 51 页 + unpdf 解 50 页在慢机上会越过 5s 默认超时；
+  // 判据本身是「截到 50 页」，与用时无关，所以给这条单独的预算。
+  it('limits untrusted PDFs to 50 pages before extraction', async () => {
+    const input = await pdfBytes(51);
+    const unpdf = getDocumentExtractorProvider('unpdf')!;
+    const unpdfExtract = vi.spyOn(unpdf, 'extract').mockImplementation(async ({ buffer }) => {
+      const prepared = await PDFDocument.load(buffer);
+      expect(prepared.getPageCount()).toBe(50);
+      return pdfArtifact('unpdf', 'bounded PDF text'.repeat(30));
+    });
+    const fetchImpl = vi.fn().mockResolvedValue(
+      new Response(input as unknown as BodyInit, {
+        headers: { 'content-type': 'application/pdf' },
+      }),
+    );
+
+    const result = await fetchAndExtractUrl('https://example.com/large.pdf', {
+      fetchImpl,
+      dispatcher,
+      minChars: 20,
+      // ★ 必须固定成"只有本地 unpdf"：不传的话 `resolveExtractionServices()`
+      //   会去解析本机 document 槽（MinerU），那个候选排在 unpdf **前面**，
+      //   于是这份 spy 根本不会被调用 —— 报出来的却是 "Extracted page body is empty"，
+      //   看起来像 PDF 解析坏了。这条用例量的是"51 页送到解析器前先截到 50 页"，
+      //   与有没有 MinerU 无关。
+      extractionServices: { document: null },
+    });
+
+    expect(result.truncated).toBe(true);
+    expect(unpdfExtract).toHaveBeenCalledOnce();
+  }, 20_000);
+
+  it('caps extracted PDF text independently of the download size', async () => {
+    const unpdf = getDocumentExtractorProvider('unpdf')!;
+    vi.spyOn(unpdf, 'extract').mockResolvedValue(pdfArtifact('unpdf', 'x'.repeat(1_200_000)));
+    const fetchImpl = vi.fn().mockResolvedValue(
+      new Response((await pdfBytes()) as unknown as BodyInit, {
+        headers: { 'content-type': 'application/pdf' },
+      }),
+    );
+
+    const result = await fetchAndExtractUrl('https://example.com/text-bomb.pdf', {
+      fetchImpl,
+      dispatcher,
+      minChars: 20,
+      // 同上：量的是 1.2M 字符的提取文本被封到 1M，与 document 槽无关。
+      extractionServices: { document: null },
+    });
+
+    expect(result.markdown).toHaveLength(1_000_000);
+    expect(result.truncated).toBe(true);
+  }, 20_000);
+
+  it('extracts a sub-500-character Chinese article because charThreshold is 200', () => {
+    const result = extractHtmlToMarkdown(chineseFixture, 'https://example.com/article');
+    expect(result.markdown.length).toBeGreaterThanOrEqual(200);
+    expect(result.markdown.length).toBeLessThan(500);
+    expect(result.markdown).toContain('科学探究');
+    expect(result.markdown).not.toMatch(/首页 导航|版权信息|隐私政策/);
+  });
+
+  it('normalizes Unicode and removes zero-width, BiDi and private-use controls', () => {
+    expect(normalizeUntrustedText('Ａ\u200bB\u202eC\ue000D')).toBe('ABCD');
+  });
+
+  it('fails fast without opening a connection when the signal is already aborted', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const fetchImpl = vi.fn();
+    await expect(
+      fetchAndExtractUrl('https://example.com/page', {
+        fetchImpl,
+        dispatcher,
+        signal: controller.signal,
+      }),
+    ).rejects.toMatchObject({ reason: 'network', message: 'Operation aborted' });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('aborts the body read when the signal fires mid-download', async () => {
+    const controller = new AbortController();
+    let releasePull: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      releasePull = resolve;
+    });
+    const body = new ReadableStream<Uint8Array>({
+      async pull(stream) {
+        stream.enqueue(new Uint8Array(1024));
+        // Stall the stream until the test stops the run, so the next read is
+        // in flight when the signal fires.
+        await gate;
+        stream.close();
+      },
+    });
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValue(new Response(body, { headers: { 'content-type': 'text/plain' } }));
+    const pending = fetchAndExtractUrl('https://example.com/slow', {
+      fetchImpl,
+      dispatcher,
+      minChars: 1,
+      signal: controller.signal,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    controller.abort();
+    releasePull?.();
+    await expect(pending).rejects.toMatchObject({
+      reason: 'network',
+      message: 'Operation aborted',
+    });
+  });
+});

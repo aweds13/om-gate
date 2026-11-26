@@ -1,0 +1,642 @@
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import type { PPTTextElement } from '@openmaic/dsl';
+import type { Scene } from '@/lib/types/stage';
+import type { CourseDocument, CourseStore } from '@/lib/server/agent-runtime/course-tools';
+import { buildDslCourseTools } from '@/lib/server/agent-runtime/dsl-tools';
+import { validateSlideCanvas } from '@/lib/server/agent-runtime/course-edit/element-schema';
+import { auditCourse, NOVEL_P90 } from '@/lib/quiz/course-audit';
+
+/**
+ * ★ `patch_stage` 的两道闸（2026-10-07 加）。
+ *
+ * ── 由来：用户实测的一句话 ──────────────────────────────────────
+ * 他说「修复一下Day1」，agent **只查了一下计划状态就直接 `patch_stage` 改页** ——
+ * 不问、也不把计划或审计给他看。两处结构性原因：
+ *
+ * ① **门槛原来只挂在 `generate_scene` 上** ⇒ "修复一页"这条**最常见的路完全不受管**。
+ *    §结论库里我自己写过"门禁必须挂在两条写入路径上"，当时只修了诊断那两条。
+ * ② 根本没有"这一页超载了，先给学习者看数字并确认"这道闸。
+ *
+ * 这一组把两道闸各钉三下（**拒**、**该放行时放行**、**别把一切都拒掉**）——
+ * 只测过拒绝路径的门禁，可能把一切都拒掉（`generation-tools` 那一组踩过同样的坑）。
+ */
+const OWNED = { kind: 'owned' as const, stage: { stageId: 'stage-test', name: 'Test course' } };
+
+/** 一份**合法**的 slide（照 `dsl-tools.test.ts` 的夹具），正文可换。 */
+function slide(order: number, body: string, id = `scene_s${order}`): Scene {
+  return {
+    id,
+    stageId: 'stage-test',
+    order,
+    title: `第 ${order} 页`,
+    type: 'slide',
+    content: {
+      type: 'slide',
+      canvas: {
+        id: `canvas-${order}`,
+        viewportSize: 1000,
+        viewportRatio: 0.5625,
+        theme: {
+          backgroundColor: '#fff',
+          themeColors: ['#2563eb'],
+          fontColor: '#111',
+          fontName: 'Inter',
+        },
+        elements: [
+          {
+            id: `el-${order}`,
+            type: 'text',
+            left: 10,
+            top: 10,
+            width: 800,
+            height: 200,
+            rotate: 0,
+            content: `<p>${body}</p>`,
+            defaultFontName: 'Inter',
+            defaultColor: '#111',
+            fill: '#fff',
+          } as PPTTextElement,
+        ],
+      },
+    },
+    actions: [],
+  } as Scene;
+}
+
+/** 90 个互不相同的三字术语 —— 实测 novel > 60（阈值 2026-10-09 从 49 抬到 60；夹具要**远高于**阈值）。 */
+function overloadBody(): string {
+  return Array.from(
+    { length: 90 },
+    (_, index) => `术语${String.fromCharCode(0x4e00 + index)}码`,
+  ).join('，');
+}
+
+function documentOf(scenes: Scene[], withOutline: boolean): CourseDocument {
+  return {
+    stage: {
+      id: 'stage-test',
+      name: 'Test course',
+      description: 'd',
+      createdAt: 1,
+      updatedAt: 1,
+    },
+    outline: {
+      outlines: withOutline
+        ? scenes.map((scene) => ({
+            id: `outline-${scene.id}`,
+            order: scene.order,
+            type: scene.type,
+            title: scene.title,
+            description: `Outline ${scene.title}`,
+            keyPoints: [],
+          }))
+        : [],
+    },
+    scenes,
+  } as unknown as CourseDocument;
+}
+
+function harness(initial: CourseDocument) {
+  let doc = structuredClone(initial);
+  const putScene = vi.fn(async (_stageId: string, scene: Scene) => {
+    doc = { ...doc, scenes: doc.scenes.map((item) => (item.id === scene.id ? scene : item)) };
+  });
+  const loadDocument = vi.fn(async (stageId: string) => (stageId === doc.stage.id ? doc : null));
+  return { store: { loadDocument, putScene } as unknown as CourseStore, get: () => doc };
+}
+
+function patchTool(
+  store: CourseStore,
+  reviewedStages?: Set<string>,
+  readReviewReceipt?: (stageId: string) => Promise<unknown | null>,
+) {
+  const tools = buildDslCourseTools({
+    store,
+    stageAccess: async () => OWNED,
+    onCheckpoint: () => undefined,
+    ...(reviewedStages ? { reviewedStages } : {}),
+    // ★ 必须显式注入：不注入时闸会去真读 `OPENMAIC_PLAN_FREEZE_DIR` 下的凭据，
+    //   而那是**跨用例共享的磁盘状态** —— 一条用例写的凭据会让后一条用例静默放行。
+    readReviewReceipt: readReviewReceipt ?? (async () => null),
+  });
+  const found = tools.find((item) => item.name === 'patch_stage');
+  if (!found) throw new Error('patch_stage missing');
+  return found as unknown as {
+    execute(
+      id: string,
+      params: Record<string, unknown>,
+    ): Promise<{
+      isError?: boolean;
+      details?: Record<string, unknown>;
+      content?: { text?: string }[];
+    }>;
+  };
+}
+
+const freezeDir = () =>
+  process.env.OPENMAIC_PLAN_FREEZE_DIR ?? join(process.cwd(), 'data', 'plan-freeze');
+
+function setFrozen(frozen: boolean, entryCount = 2) {
+  mkdirSync(freezeDir(), { recursive: true });
+  writeFileSync(
+    join(freezeDir(), 'stage-test.json'),
+    JSON.stringify({
+      stageId: 'stage-test',
+      frozen,
+      frozenAt: frozen ? 1 : undefined,
+      frozenEntryCount: entryCount,
+      revision: 0,
+      revisions: [],
+    }),
+    'utf8',
+  );
+}
+
+const setOp = (id: string, text: string) => [
+  { op: 'set', path: `/content/canvas/elements/0/content`, value: `<p>${text}</p>` },
+];
+
+const PREV_GATE = process.env.OPENMAIC_PLAN_GATE;
+afterEach(() => {
+  if (PREV_GATE === undefined) delete process.env.OPENMAIC_PLAN_GATE;
+  else process.env.OPENMAIC_PLAN_GATE = PREV_GATE;
+});
+
+describe('★ patch_stage：计划门槛（② 与 generate_scene 同一条判据）', () => {
+  it('门槛关着时不拦（默认部署以外的地方不受影响）', async () => {
+    delete process.env.OPENMAIC_PLAN_GATE;
+    const current = harness(documentOf([slide(1, '短内容')], false));
+    const response = await patchTool(current.store).execute('c', {
+      stageId: 'stage-test',
+      target: '/scenes/1',
+      intent: '改一下',
+      ops: setOp('el-1', '改过的内容'),
+    });
+    expect(response.details?.blocked).toBeUndefined();
+  });
+
+  it('★ 门槛开着 + 计划为空 ⇒ 拒；而且消息里报的是【patch_stage】，不是 generate_scene', async () => {
+    process.env.OPENMAIC_PLAN_GATE = '1';
+    const current = harness(documentOf([slide(1, '短内容')], false));
+    const response = await patchTool(current.store).execute('c', {
+      stageId: 'stage-test',
+      target: '/scenes/1',
+      intent: '改一下',
+      ops: setOp('el-1', '改过的内容'),
+    });
+    const text = (response.content?.[0]?.text ?? '') + JSON.stringify(response.details);
+    expect(response.isError).toBe(true);
+    expect(response.details?.blocked).toBe('plan-not-frozen');
+    expect(text).toContain('patch_stage 被拒绝');
+    // ★ 这条是刻意的：原来三条拒绝信息都写死 generate_scene，
+    //   搬到 patch_stage 之后会让模型以为该去调 generate_scene。
+    expect(text).not.toContain('generate_scene 被拒绝');
+    // 而且是**在任何写入之前**拒的 —— 页面没被动过。
+    expect(current.get().scenes[0]?.content).toMatchObject({
+      canvas: { elements: [{ content: '<p>短内容</p>' }] },
+    });
+  });
+
+  it('★ 该放行时放行：门槛开着 + 已冻结 + 这一页在计划里 ⇒ 不拦', async () => {
+    process.env.OPENMAIC_PLAN_GATE = '1';
+    setFrozen(true, 1);
+    const current = harness(documentOf([slide(1, '短内容')], true));
+    const response = await patchTool(current.store).execute('c', {
+      stageId: 'stage-test',
+      target: '/scenes/1',
+      intent: '改一下',
+      ops: setOp('el-1', '改过的内容'),
+    });
+    expect(response.details?.blocked).toBeUndefined();
+    expect(response.isError).toBeFalsy();
+  });
+});
+
+describe('★ patch_stage：超载页必须先给学习者看数字（② 新增的闸）', () => {
+  it('夹具前提成立：那一页真的被判超载', () => {
+    const page = slide(1, overloadBody());
+    const audit = auditCourse([
+      {
+        stageId: 'stage-test',
+        sceneId: page.id,
+        order: 1,
+        title: page.title,
+        type: page.type,
+        content: page.content,
+      },
+    ]);
+    // ★ 前提本身也要断言 —— 否则夹具哪天不再超载，这一组会【静默地空过】。
+    expect(audit.pages[0]?.novel).toBeGreaterThan(NOVEL_P90);
+  });
+
+  it('★ 超载页 + 没有确认 ⇒ 拒，并把数字给出来', async () => {
+    delete process.env.OPENMAIC_PLAN_GATE; // 只让这道闸生效
+    const current = harness(documentOf([slide(1, overloadBody())], true));
+    const response = await patchTool(current.store).execute('c', {
+      stageId: 'stage-test',
+      target: '/scenes/1',
+      intent: '把这页改小一点',
+      ops: setOp('el-1', '改过的内容'),
+    });
+    const text = response.content?.[0]?.text ?? '';
+    expect(response.isError).toBe(true);
+    expect(response.details?.blocked).toBe('page-overloaded');
+    expect(response.details?.novelP90).toBe(NOVEL_P90);
+    expect(typeof response.details?.novel).toBe('number');
+    // 拒绝信息里必须有：数字、`ask_user`、以及"拿到答复再带 flag 回来"。
+    expect(text).toContain(String(NOVEL_P90));
+    expect(text).toContain('ask_user');
+    expect(text).toContain('overloadAcknowledged');
+    // 同样：拒在写入之前。
+    expect(current.get().scenes[0]?.content).toMatchObject({
+      canvas: { elements: [{ content: `<p>${overloadBody()}</p>` }] },
+    });
+  });
+
+  it('★ 带上确认 ⇒ 放行', async () => {
+    delete process.env.OPENMAIC_PLAN_GATE;
+    const current = harness(documentOf([slide(1, overloadBody())], true));
+    const response = await patchTool(current.store).execute('c', {
+      stageId: 'stage-test',
+      target: '/scenes/1',
+      intent: '学习者选了拆页，先改这一页',
+      ops: setOp('el-1', '改过的内容'),
+      overloadAcknowledged: true,
+    });
+    expect(response.details?.blocked).toBeUndefined();
+  });
+
+  it('★ 别把一切都拒掉：**不超载**的页不需要确认', async () => {
+    delete process.env.OPENMAIC_PLAN_GATE;
+    const current = harness(documentOf([slide(1, '短内容')], true));
+    const response = await patchTool(current.store).execute('c', {
+      stageId: 'stage-test',
+      target: '/scenes/1',
+      intent: '改一下',
+      ops: setOp('el-1', '改过的内容'),
+    });
+    expect(response.details?.blocked).toBeUndefined();
+  });
+});
+
+/**
+ * ★ 2026-10-08 新增的两道闸：**结构洞**（空页 / 引用指向空页或越界）与**审查凭据**。
+ *
+ * 由来一（结构洞）：Day02 第 19 页《嵌套循环：双层 for 怎么跑》的 `canvas.elements` 是
+ * **0 个**，而第 18 页写着「双层 for 见第 19 页」。这两条**逐页 diff 看不出来**，
+ * 上一版只在 `course_audit` 里报 —— agent 不主动跑就永远看不到。
+ *
+ * 由来二（审查凭据）：用户要「第一次修改老课之前，要有一张审过的凭据」。**必须是代码闸**：
+ * 本仓栽过一次 —— 说了「修复一下 Day1」，agent 查了一下就直接改页，不问也不审。
+ *
+ * 两道闸的规矩与超载闸一致：**先拒一次、把数字摆出来、问过之后带凭据再来**；
+ * 而且都在**任何写入之前**拒（页面没被动过）。
+ */
+/**
+ * ★ 含**旧生成器写的表**的页必须能改（2026-10-08 实测根因）。
+ *
+ * 报错原文（真库 seq 21121）：`patch_stage rejected at op 1: patch rejected:
+ * canvas/elements/12: must have required properties ...` —— 而第 21 页 index 12 就是那张表，
+ * 它的键里**没有 `cellMinHeight`**（旧生成器不写这个字段），而它当时是**必需**字段。
+ *
+ * 关键在"**整页连坐**"：校验的是**改完之后整份 scene**，所以一个元素不合格 ⇒
+ * 这一页任何改动都进不去（连改旁边一个 `text` 的 `str_replace` 也一样）。
+ * 实测后果：第 21 页那三条说明补不进去，只能挪到第 22 页。
+ */
+function sceneWithLegacyTable(): Scene {
+  // 拿现成的合法 slide 当底座，再挂一张**旧生成器形状**的表（没有 cellMinHeight），
+  // 这样 canvas 的必需字段都由底座保证 —— 上一版我自己手写 canvas，报的是 canvas 缺字段，
+  // 把真正的表问题盖住了。
+  const scene = structuredClone(slide(1, '短内容')) as unknown as {
+    content: { canvas: { elements: unknown[] } };
+  };
+  scene.content.canvas.elements.push({
+    id: 'table-legacy',
+    type: 'table',
+    left: 60,
+    top: 260,
+    width: 800,
+    height: 120,
+    rotate: 0,
+    outline: { color: '#e5e7eb', style: 'solid', width: 1 },
+    colWidths: [0.5, 0.5],
+    data: [
+      [
+        { id: 'c1', colspan: 1, rowspan: 1, text: '代码', style: { bold: true } },
+        { id: 'c2', colspan: 1, rowspan: 1, text: '结果', style: { bold: true } },
+      ],
+    ],
+  });
+  return scene as unknown as Scene;
+}
+
+/**
+ * ★ 校验报错必须**能直接定位**（2026-10-08）。
+ *
+ * 原来是把原始错误平铺：一个元素的可辨识联合会刷出几十行，而打印时在 **560 字符处截断** ——
+ * 真正有用的那一行（table 分支说"缺 cellMinHeight"）正好被截掉。那次定位靠的是
+ * "翻出那一页的原始数据 + 三轮比对"，光看报错定不出来。所以：
+ * · 每个元素一行，带**元素实际的 type**（错误消息里本来没有它）；
+ * · `must be equal to constant` 是鉴别器噪声（每个变体都喊一次），一律丢掉。
+ */
+describe('★ 校验报错按元素汇总（不再被截断埋掉关键那一行）', () => {
+  it('★ 一张缺 data 的表 ⇒ 一行说清「type=table 缺必需字段 data」，且没有鉴别器噪声', () => {
+    const canvas = (
+      structuredClone(slide(1, '短内容')) as unknown as {
+        content: {
+          canvas: {
+            elements: unknown[];
+          };
+        };
+      }
+    ).content.canvas;
+    canvas.elements.push({
+      id: 'table-broken',
+      type: 'table',
+      left: 60,
+      top: 260,
+      width: 800,
+      height: 120,
+      rotate: 0,
+      outline: { color: '#e5e7eb', style: 'solid', width: 1 },
+      colWidths: [0.5, 0.5],
+      // ★ 故意缺 data（它是结构字段，必需）
+    });
+    const issues = validateSlideCanvas(canvas);
+    const joined = issues.join(' | ');
+    expect(joined).toContain('(table)');
+    expect(joined).toContain('data');
+    expect(joined).not.toContain('must be equal to constant');
+    // 汇总后应当很短：一个元素一行，不是几十行
+    expect(issues.length).toBeLessThanOrEqual(3);
+  });
+});
+
+describe('★ 旧生成器写的表：单元格 fontsize 是数字也要收（2026-10-08）', () => {
+  it('★ fontsize: 14（数字）⇒ 整张表合格，页面改得动', () => {
+    const canvas = (
+      structuredClone(slide(1, '短内容')) as unknown as {
+        content: {
+          canvas: {
+            elements: unknown[];
+          };
+        };
+      }
+    ).content.canvas;
+    canvas.elements.push({
+      id: 'table-fontsize',
+      type: 'table',
+      left: 60,
+      top: 260,
+      width: 800,
+      height: 120,
+      rotate: 0,
+      outline: { color: '#e5e7eb', style: 'solid', width: 1 },
+      colWidths: [0.5, 0.5],
+      data: [
+        [{ id: 'c1', colspan: 1, rowspan: 1, text: 'A', style: { fontsize: 14, bold: true } }],
+      ],
+    });
+    expect(validateSlideCanvas(canvas)).toEqual([]);
+  });
+});
+
+/**
+ * ★ 更正（2026-10-09）：`code` / `video` / `audio` **一直都在合同里**。
+ *
+ * 我上一条判据写的是"type=code ⇒ 这个类型不在合同里" —— 那是**假话**：我当时给汇总器做了一张
+ * 查找表，只照 union 的前 7 行手抄，把后 3 类漏了，于是**我自己的表**比合同窄，
+ * 我还把这条假话钉成了判据。**手写镜像比现实窄 —— 同一个病，这次犯在我身上。**
+ * 现在判据反过来：这三类必须被认成合同内；只有**真正不认识**的名字才报"不在合同里"。
+ */
+describe('★ 元素类型必须在合同内（含 code / video / audio）', () => {
+  it('★ type=code 的元素 ⇒ **不许**说"不在合同里"', () => {
+    const canvas = (
+      structuredClone(slide(1, '短内容')) as unknown as {
+        content: {
+          canvas: {
+            elements: unknown[];
+          };
+        };
+      }
+    ).content.canvas;
+    canvas.elements.push({
+      id: 'code-1',
+      type: 'code',
+      left: 60,
+      top: 260,
+      width: 800,
+      height: 100,
+      rotate: 0,
+      language: 'java',
+      lines: [{ id: 'l1', content: 'int n = -7;' }],
+    });
+    const joined = validateSlideCanvas(canvas).join(' | ');
+    expect(joined).not.toContain('不在合同里');
+  });
+
+  it('★ 真正不认识的名字 ⇒ 才报"不在合同里"（并列出合同有哪些）', () => {
+    const canvas = (
+      structuredClone(slide(1, '短内容')) as unknown as {
+        content: {
+          canvas: {
+            elements: unknown[];
+          };
+        };
+      }
+    ).content.canvas;
+    canvas.elements.push({
+      id: 'x-1',
+      type: 'not-a-real-type',
+      left: 0,
+      top: 0,
+      width: 10,
+      height: 10,
+      rotate: 0,
+    });
+    const joined = validateSlideCanvas(canvas).join(' | ');
+    expect(joined).toContain('unknown element type');
+    expect(joined).toContain('code');
+  });
+});
+
+describe('★ patch_stage：含旧生成器写的表（无 cellMinHeight）也能改', () => {
+  it('★ 改旁边那个 text ⇒ 必须成功（不许因为表少一个可选字段锁死整页）', async () => {
+    delete process.env.OPENMAIC_PLAN_GATE;
+    const current = harness(documentOf([sceneWithLegacyTable()], false));
+    const response = await patchTool(current.store, new Set(['stage-test'])).execute('c', {
+      stageId: 'stage-test',
+      target: '/scenes/1',
+      intent: '给这一页补一句说明',
+      ops: setOp('el-1', '补上的说明'),
+    });
+    const text = response.content?.[0]?.text ?? '';
+    expect(response.isError).toBeFalsy();
+    expect(text).not.toContain('rejected at op');
+  });
+});
+
+describe('★ patch_stage：结构洞闸（空页 / 坏引用）', () => {
+  const emptySlide = (order: number): Scene =>
+    ({
+      id: `scene-empty-${order}`,
+      stageId: 'stage-test',
+      order,
+      type: 'slide',
+      title: `空页 ${order}`,
+      content: { type: 'slide', canvas: { elements: [] } },
+      actions: [],
+    }) as unknown as Scene;
+
+  it('★ 课里有空页 ⇒ 拒绝，并把页码摆出来；页面一个字没动', async () => {
+    delete process.env.OPENMAIC_PLAN_GATE;
+    const current = harness(documentOf([slide(1, '短内容'), emptySlide(2)], false));
+    const response = await patchTool(current.store).execute('c', {
+      stageId: 'stage-test',
+      target: '/scenes/1',
+      intent: '改一下',
+      ops: setOp('el-1', '改过的内容'),
+    });
+    const text = (response.content?.[0]?.text ?? '') + JSON.stringify(response.details);
+    expect(response.isError).toBe(true);
+    expect(response.details?.blocked).toBe('course-has-holes');
+    expect(response.details?.emptyPages).toEqual([2]);
+    expect(text).toContain('结构性空洞');
+    expect(current.get().scenes[0]?.content).toMatchObject({
+      canvas: { elements: [{ content: '<p>短内容</p>' }] },
+    });
+  });
+
+  it('★ 引用指向空页也算洞 ⇒ 拒绝', async () => {
+    delete process.env.OPENMAIC_PLAN_GATE;
+    const current = harness(documentOf([slide(1, '双层 for 见第 2 页'), emptySlide(2)], false));
+    const response = await patchTool(current.store).execute('c', {
+      stageId: 'stage-test',
+      target: '/scenes/1',
+      intent: '改一下',
+      ops: setOp('el-1', '改过的内容'),
+    });
+    expect(response.details?.blocked).toBe('course-has-holes');
+    expect(JSON.stringify(response.details)).toContain('"to":2');
+  });
+
+  it('★ 带上凭据 ⇒ 放行（闸只拒第一次，不是棘轮）', async () => {
+    delete process.env.OPENMAIC_PLAN_GATE;
+    const current = harness(documentOf([slide(1, '短内容'), emptySlide(2)], false));
+    const response = await patchTool(current.store).execute('c', {
+      stageId: 'stage-test',
+      target: '/scenes/1',
+      intent: '补完空页之后再改这页',
+      ops: setOp('el-1', '改过的内容'),
+      holesAcknowledged: true,
+      reviewAcknowledged: true,
+    });
+    expect(response.isError).toBeFalsy();
+    expect(response.details?.blocked).toBeUndefined();
+  });
+});
+
+describe('★ patch_stage：审查闸（B 方案）', () => {
+  const eightPages = (): Scene[] =>
+    Array.from({ length: 8 }, (_, index) => slide(index + 1, '短内容'));
+
+  it('★ 8 页的课 + 这次运行里没审过 ⇒ 拒绝，并说清两条出口', async () => {
+    delete process.env.OPENMAIC_PLAN_GATE;
+    const current = harness(documentOf(eightPages(), false));
+    const response = await patchTool(current.store).execute('c', {
+      stageId: 'stage-test',
+      target: '/scenes/2',
+      intent: '改一下',
+      ops: setOp('el-1', '改过的内容'),
+    });
+    const text = (response.content?.[0]?.text ?? '') + JSON.stringify(response.details);
+    expect(response.isError).toBe(true);
+    expect(response.details?.blocked).toBe('course-not-reviewed');
+    expect(response.details?.pageCount).toBe(8);
+    expect(text).toContain('review_course');
+    expect(text).toContain('reviewAcknowledged');
+  });
+
+  it('★ 同一运行里审过 ⇒ 放行（凭据真的被读了）', async () => {
+    delete process.env.OPENMAIC_PLAN_GATE;
+    const current = harness(documentOf(eightPages(), false));
+    const response = await patchTool(current.store, new Set(['stage-test'])).execute('c', {
+      stageId: 'stage-test',
+      target: '/scenes/2',
+      intent: '改一下',
+      ops: setOp('el-1', '改过的内容'),
+    });
+    expect(response.isError).toBeFalsy();
+    expect(response.details?.blocked).toBeUndefined();
+  });
+
+  it('★ 课太小（< 8 页）不拦 —— 审查一次的成本比收益大', async () => {
+    delete process.env.OPENMAIC_PLAN_GATE;
+    const current = harness(documentOf([slide(1, '短内容')], false));
+    const response = await patchTool(current.store).execute('c', {
+      stageId: 'stage-test',
+      target: '/scenes/1',
+      intent: '改一下',
+      ops: setOp('el-1', '改过的内容'),
+    });
+    expect(response.details?.blocked).toBeUndefined();
+  });
+
+  it('★ 明说不用审 ⇒ 放行', async () => {
+    delete process.env.OPENMAIC_PLAN_GATE;
+    const current = harness(documentOf(eightPages(), false));
+    const response = await patchTool(current.store).execute('c', {
+      stageId: 'stage-test',
+      target: '/scenes/2',
+      intent: '学习者说这次不用审',
+      ops: setOp('el-1', '改过的内容'),
+      reviewAcknowledged: true,
+    });
+    expect(response.isError).toBeFalsy();
+  });
+});
+
+/**
+ * ★ 审查凭据**落盘**（2026-10-08：用户定了「收尾时审一次」）。
+ *
+ * 既然审查发生在**课程收尾**，那"以后再来修这门课"就是**另一次运行** ——
+ * 凭据只在 run 内有效的话，每次修老课都会被迫重审整门课（一次长上下文调用）。
+ * 所以盘上的凭据必须被认。
+ */
+describe('★ patch_stage：审查凭据落盘（跨 run）', () => {
+  const eightPages = (): Scene[] =>
+    Array.from({ length: 8 }, (_, index) => slide(index + 1, '短内容'));
+
+  it('★ 盘上有凭据 ⇒ 放行（这次运行没审过也算）', async () => {
+    delete process.env.OPENMAIC_PLAN_GATE;
+    const current = harness(documentOf(eightPages(), false));
+    const receipt = {
+      stageId: 'stage-test',
+      reviewedAt: '2026-10-08T00:00:00.000Z',
+      pageCount: 8,
+      reportChars: 900,
+    };
+    const response = await patchTool(current.store, undefined, async () => receipt).execute('c', {
+      stageId: 'stage-test',
+      target: '/scenes/2',
+      intent: '收尾时审过了，这次只改一页',
+      ops: setOp('el-1', '改过的内容'),
+    });
+    expect(response.isError).toBeFalsy();
+    expect(response.details?.blocked).toBeUndefined();
+  });
+
+  it('★ 盘上**没有**凭据 ⇒ 照旧拒（别把闸放成空的）', async () => {
+    delete process.env.OPENMAIC_PLAN_GATE;
+    const current = harness(documentOf(eightPages(), false));
+    const response = await patchTool(current.store, undefined, async () => null).execute('c', {
+      stageId: 'stage-test',
+      target: '/scenes/2',
+      intent: '改一下',
+      ops: setOp('el-1', '改过的内容'),
+    });
+    expect(response.details?.blocked).toBe('course-not-reviewed');
+  });
+});
